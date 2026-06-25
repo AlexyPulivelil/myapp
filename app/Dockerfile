@@ -23,7 +23,6 @@ USER appuser
 
 EXPOSE 8080
 
-# DATABASE_URL is injected at runtime by ECS from Secrets Manager — never bake it in here
 ENV PORT=8080 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
