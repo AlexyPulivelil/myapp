@@ -1,0 +1,94 @@
+name: Deploy to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy — leave blank to use the latest pushed tag"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: myapp
+
+jobs:
+  deploy:
+    name: Deploy to Production EC2
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: List recent tags from Docker Hub
+        run: |
+          echo "Available tags (most recent first):"
+          curl -s "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}/tags/?page_size=10&ordering=last_updated" \
+            | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for t in data.get('results', []):
+              print(f\"  {t['name']}  (pushed: {t['tag_last_pushed'][:10]})\")
+          "
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          INPUT="${{ github.event.inputs.image_tag }}"
+          if [ -z "$INPUT" ]; then
+            TAG=$(curl -s "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}/tags/?page_size=1&ordering=last_updated" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin)['results'][0]['name'])")
+            echo "No tag provided — resolved to latest: $TAG"
+          else
+            TAG="$INPUT"
+            echo "Using provided tag: $TAG"
+          fi
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy to production EC2
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          IMAGE_TAG: ${{ steps.tag.outputs.tag }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+        with:
+          host: ${{ secrets.PROD_EC2_IP }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DOCKERHUB_USERNAME,DOCKERHUB_TOKEN,IMAGE_TAG,IMAGE_NAME
+          script: |
+            DATABASE_URL=$(aws secretsmanager get-secret-value \
+              --secret-id myapp/database-url \
+              --region us-east-1 \
+              --query 'SecretString' \
+              --output text | python3 -c "import sys,json; print(json.load(sys.stdin)['DATABASE_URL'])")
+
+            echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USERNAME" --password-stdin
+            docker pull "$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
+            docker stop myapp || true
+            docker rm myapp || true
+            docker run -d \
+              --name myapp \
+              --restart unless-stopped \
+              -p 80:8080 \
+              -e DATABASE_URL="$DATABASE_URL" \
+              "$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
+
+            echo "Production running: $IMAGE_TAG"
+
+      - name: Health check
+        run: |
+          sleep 15
+          for i in $(seq 1 6); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ secrets.PROD_EC2_IP }}/health" || echo "000")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i: HTTP $STATUS — retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed"
+          exit 1
