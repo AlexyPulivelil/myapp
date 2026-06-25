@@ -37,7 +37,16 @@ jobs:
       - name: Build Docker image
         run: docker build --tag "${{ steps.meta.outputs.image_ref }}" app/
 
-      - name: Run Trivy vulnerability scan
+      - name: Trivy scan (log summary)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.image_ref }}
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "0"
+          ignore-unfixed: true
+
+      - name: Trivy scan (SARIF for Security tab)
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.meta.outputs.image_ref }}
