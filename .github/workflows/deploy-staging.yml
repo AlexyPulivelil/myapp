@@ -1,0 +1,119 @@
+name: Deploy to Staging
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ENVIRONMENT: staging
+  IMAGE_NAME: myapp
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ secrets.CLUSTER_NAME }}-app" \
+            --query taskDefinition \
+            > task-definition.json
+
+      - name: Render new task definition with updated image
+        id: render-task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+      - name: Run DB migrations as ECS one-off task
+        run: |
+          TASK_ARN=$(aws ecs run-task \
+            --cluster "${{ secrets.CLUSTER_NAME }}" \
+            --task-definition "${{ secrets.CLUSTER_NAME }}-app" \
+            --launch-type FARGATE \
+            --network-configuration "awsvpcConfiguration={subnets=$(
+                aws ecs describe-services \
+                  --cluster "${{ secrets.CLUSTER_NAME }}" \
+                  --services "${{ secrets.CLUSTER_NAME }}-app" \
+                  --query 'services[0].networkConfiguration.awsvpcConfiguration.subnets' \
+                  --output text | tr '\t' ','
+              ),securityGroups=$(
+                aws ecs describe-services \
+                  --cluster "${{ secrets.CLUSTER_NAME }}" \
+                  --services "${{ secrets.CLUSTER_NAME }}-app" \
+                  --query 'services[0].networkConfiguration.awsvpcConfiguration.securityGroups' \
+                  --output text | tr '\t' ','
+              ),assignPublicIp=DISABLED}" \
+            --overrides '{"containerOverrides":[{"name":"app","command":["python","-c","from app import init_db; init_db()"]}]}' \
+            --query 'tasks[0].taskArn' \
+            --output text)
+
+          echo "Migration task ARN: ${TASK_ARN}"
+
+          aws ecs wait tasks-stopped \
+            --cluster "${{ secrets.CLUSTER_NAME }}" \
+            --tasks "${TASK_ARN}"
+
+          EXIT_CODE=$(aws ecs describe-tasks \
+            --cluster "${{ secrets.CLUSTER_NAME }}" \
+            --tasks "${TASK_ARN}" \
+            --query 'tasks[0].containers[0].exitCode' \
+            --output text)
+
+          if [ "${EXIT_CODE}" != "0" ]; then
+            echo "Migration task failed with exit code ${EXIT_CODE}"
+            exit 1
+          fi
+          echo "Migrations completed successfully"
+
+      - name: Deploy to ECS staging service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-task-def.outputs.task-definition }}
+          service: ${{ secrets.CLUSTER_NAME }}-app
+          cluster: ${{ secrets.CLUSTER_NAME }}
+          wait-for-service-stability: true
+
+      - name: Smoke test — assert HTTP 200 from staging ALB
+        run: |
+          ALB_URL=$(aws cloudformation describe-stacks \
+            --stack-name "myapp-staging" \
+            --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" \
+            --output text 2>/dev/null || \
+            aws elbv2 describe-load-balancers \
+              --query "LoadBalancers[?contains(LoadBalancerName,'staging')].DNSName | [0]" \
+              --output text)
+
+          echo "Testing ALB: https://${ALB_URL}/health"
+
+          for i in $(seq 1 10); do
+            STATUS=$(curl -sk -o /dev/null -w "%{http_code}" "https://${ALB_URL}/health" || echo "000")
+            if [ "${STATUS}" = "200" ]; then
+              echo "Smoke test passed (attempt ${i}): HTTP ${STATUS}"
+              exit 0
+            fi
+            echo "Attempt ${i}: HTTP ${STATUS} — retrying in 10s..."
+            sleep 10
+          done
+
+          echo "Smoke test failed after 10 attempts"
+          exit 1
