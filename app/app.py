@@ -82,7 +82,8 @@ def create_item():
         return jsonify({"error": "database unavailable"}), 503
 
 
+init_db()
+
 if __name__ == "__main__":
-    init_db()
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
