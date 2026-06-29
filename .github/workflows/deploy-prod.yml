@@ -74,6 +74,10 @@ jobs:
               --restart unless-stopped \
               -p 80:8080 \
               -e DATABASE_URL="$DATABASE_URL" \
+              --log-driver awslogs \
+              --log-opt awslogs-region=us-east-1 \
+              --log-opt awslogs-group=/myapp/production \
+              --log-opt awslogs-stream=app \
               "$DOCKERHUB_USERNAME/$IMAGE_NAME:$IMAGE_TAG"
 
             echo "Production running: $IMAGE_TAG"
