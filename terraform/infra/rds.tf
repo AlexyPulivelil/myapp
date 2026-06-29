@@ -77,4 +77,8 @@ resource "aws_secretsmanager_secret_version" "db_url" {
   secret_string = jsonencode({
     DATABASE_URL = "postgresql://${var.db_username}:${random_password.db.result}@${module.rds.db_instance_endpoint}/appdb"
   })
+
+  lifecycle {
+    replace_triggered_by = [random_password.db]
+  }
 }
